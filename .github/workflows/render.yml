@@ -1,0 +1,173 @@
+name: Parallel Render
+
+# Renders one cartoon-audio-short project in parallel:
+# frames are split into chunks, each chunk renders on its own runner,
+# then a finish job assembles frames + mix_raw.wav and encodes the MP4.
+#
+# Project folders live under projects/<project>/ — see projects/PROJECT-LAYOUT.md.
+# The raw voiceover is NEVER in this repo: Rio mixes it locally into
+# mix_raw.wav (music/SFX at -6 dB under the voice) before pushing a project.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Project folder name under projects/"
+        required: true
+        type: string
+      total_frames:
+        description: "Total frame count (voiceover seconds x 30)"
+        required: true
+        type: number
+      chunks:
+        description: "How many parallel render jobs to split into"
+        required: false
+        default: 8
+        type: number
+      title:
+        description: "Final video title (becomes the MP4 file name)"
+        required: true
+        type: string
+
+jobs:
+  prepare:
+    name: Split frames into ranges
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+    steps:
+      - id: split
+        name: Compute frame ranges
+        env:
+          TOTAL: ${{ inputs.total_frames }}
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          total = int(float(os.environ["TOTAL"]))
+          chunks = int(float(os.environ["CHUNKS"]))
+          n = max(1, min(chunks, total))
+          base, rem = divmod(total, n)
+          ranges, start = [], 0
+          for i in range(n):
+              size = base + (1 if i < rem else 0)
+              ranges.append({"start": start, "end": start + size - 1})
+              start += size
+          matrix = json.dumps({"range": ranges})
+          print(matrix)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"matrix={matrix}\n")
+          EOF
+
+  render:
+    name: Render frames ${{ matrix.range.start }}-${{ matrix.range.end }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PROJECT: ${{ inputs.project }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-1.65.1-${{ hashFiles('.github/workflows/render.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-1.65.1-
+
+      # Global install first: kit/tools/setup.sh symlinks the global
+      # playwright package into the assembled project (node_modules/playwright).
+      - name: Install Playwright + Chromium
+        run: |
+          npm install -g playwright@1.65.1
+          playwright install --with-deps chromium
+
+      # setup.sh <dir> builds the project exactly as it does locally:
+      # engine + tools copied in, three.module.js fetched, web/toon.js built
+      # from kit/vendor/toon.ts + web/roman.js.
+      - name: Assemble project from kit
+        run: bash kit/tools/setup.sh "$GITHUB_WORKSPACE/proj"
+
+      # Overlay the project's own files (see projects/PROJECT-LAYOUT.md):
+      # customised web/ files first, then the story, then rebuild toon.js
+      # in case web/roman.js was customised.
+      - name: Overlay project files
+        run: |
+          SRC="projects/$PROJECT"
+          if [ -d "$SRC/web" ]; then cp -r "$SRC/web/." proj/web/; fi
+          cp "$SRC/story.js" proj/web/story.js
+          cat proj/web/toonbase.js proj/web/roman.js > proj/web/toon.js
+          [ -f "$SRC/script.txt" ] && cp "$SRC/script.txt" proj/script.txt || true
+          [ -f "$SRC/audio.py" ] && cp "$SRC/audio.py" proj/audio.py || true
+
+      # render.mjs resolves web/ from the current directory and writes
+      # frames/f%04d.jpg into the given outdir. RESUME=1 skips frames that
+      # already exist, so a re-run of this job only fills the gaps.
+      - name: Render frame range
+        working-directory: proj
+        env:
+          RANGE: ${{ matrix.range.start }}-${{ matrix.range.end }}
+        run: RESUME=1 node render.mjs frames "$RANGE"
+
+      - name: Upload frames chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: frames-${{ matrix.range.start }}-${{ matrix.range.end }}
+          path: proj/frames/*.jpg
+          retention-days: 1
+
+  finish:
+    name: Assemble and encode final MP4
+    needs: render
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PROJECT: ${{ inputs.project }}
+      TITLE: ${{ inputs.title }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all frame chunks (merged)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: frames-*
+          merge-multiple: true
+          path: proj/frames
+
+      # finish.sh runs inside a project dir and only needs frames/ +
+      # mix_raw.wav there — the same finish.sh setup.sh copies into projects.
+      - name: Place mix and finish.sh
+        run: |
+          mkdir -p proj/out
+          cp "projects/$PROJECT/mix_raw.wav" proj/mix_raw.wav
+          cp kit/tools/finish.sh proj/finish.sh
+
+      - name: Ensure ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -1
+
+      # finish.sh: loudnorm the mix, encode frames at 30 fps to
+      # out/<Title-With-Dashes>.mp4, print ffprobe info + freeze/black QA.
+      - name: Encode final video
+        working-directory: proj
+        run: bash finish.sh "$TITLE"
+
+      - name: Upload final video
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: proj/out/*.mp4
+          retention-days: 7
