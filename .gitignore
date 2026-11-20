@@ -1,0 +1,12 @@
+# local junk — never commit
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+
+# render outputs if the kit is ever run locally inside this repo
+frames/
+out/
+work/
+stills/
+proj/
