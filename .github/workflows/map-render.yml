@@ -1,0 +1,52 @@
+name: Map Render (Python frames, 20 chunks)
+on:
+  workflow_dispatch:
+    inputs:
+      total_frames:
+        description: "Total frames to render"
+        required: true
+        default: "5137"
+      chunks:
+        description: "Chunk count (matrix is fixed at 20)"
+        required: true
+        default: "20"
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps + fonts
+        run: |
+          pip install --quiet pillow numpy
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-dejavu-core fonts-dejavu-extra > /dev/null
+      - name: Render my slice
+        run: |
+          python3 - << 'PY'
+          import math, os
+          total = int("${{ inputs.total_frames }}"); chunks = int("${{ inputs.chunks }}")
+          i = int("${{ matrix.chunk }}")
+          size = math.ceil(total / chunks)
+          start, end = i*size, min(total, (i+1)*size)
+          open("slice.txt","w").write(f"{start} {end}")
+          print("chunk", i, "of", chunks, "frames", start, end)
+          PY
+          read START END < slice.txt
+          if [ "$START" -lt "$END" ]; then
+            python3 projects/louisiana-purchase/render.py --start $START --end $END --out frames
+            cd frames && zip -q ../frames.zip *.jpg && cd ..
+          else
+            echo "empty slice" > frames.zip.txt && zip -q frames.zip frames.zip.txt
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: map-frames-${{ matrix.chunk }}
+          path: frames.zip
+          retention-days: 3
