@@ -35,7 +35,7 @@ jobs:
           i = int("${{ matrix.chunk }}")
           size = math.ceil(total / chunks)
           start, end = i*size, min(total, (i+1)*size)
-          open("slice.txt","w").write(f"{start} {end}")
+          open("slice.txt","w").write(f"{start} {end}\n")
           print("chunk", i, "of", chunks, "frames", start, end)
           PY
           read START END < slice.txt
